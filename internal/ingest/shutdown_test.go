@@ -1,4 +1,3 @@
-package ingest
 package ingest_test
 
 import (
