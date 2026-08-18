@@ -15,16 +15,16 @@ import (
 
 // recordingWork stands in for downloading and transcoding a recording.
 const (
-	recordingWork = 50 * time.Millisecond
+	recordingWork    = 50 * time.Millisecond
 	recordingTimeout = 30 * time.Second
 )
 
 // Service ingests webhook deliveries.
 type Service struct {
-	store *store.Store
-	cache *stats.Cache
-	rdb   *redis.Client
-	log   *slog.Logger
+	store    *store.Store
+	cache    *stats.Cache
+	rdb      *redis.Client
+	log      *slog.Logger
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 }
@@ -50,15 +50,6 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -74,16 +65,26 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	// One transaction decides, atomically, whether this delivery is new and
+	// applies every consequence of it. Asking the database "have I seen this?"
+	// and then acting on the answer is what let concurrent redeliveries
+	// through.
+	first, err := s.store.RecordDelivery(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !first {
+		// Not an error: the provider is allowed to redeliver, and it needs a
+		// 2xx or it will keep trying.
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
-		// Recordings are slow to fetch, so that part does not block the provider.
+
+	// Only after the transaction committed, so the in-memory view cannot count
+	// a delivery that Postgres rolled back.
+	s.cache.Record(rec.AccountID, rec.DurationSec)
+	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		s.startRecordingWork(rec)
 	}

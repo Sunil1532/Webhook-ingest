@@ -81,6 +81,58 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	return err
 }
 
+// RecordDelivery stores one webhook delivery and folds it into the call
+// record and the durable per-account aggregate, in a single transaction.
+
+func (s *Store) RecordDelivery(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	// Rollback after a successful Commit is a no-op, so this is safe as a
+	// blanket cleanup for every error path below.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+		return false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // UpsertCall creates or refreshes the call record for this event.
 func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
