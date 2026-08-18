@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/config"
 	"github.com/convin/webhook-ingest/internal/httpapi"
@@ -57,9 +58,10 @@ func NewStore(t *testing.T) *store.Store {
 	return s
 }
 
-// NewServer starts an in-process HTTP server backed by the configured
-// Postgres and Redis, and returns it alongside the store for assertions.
-func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
+
+// assertions. Use this for tests that need to drive the service directly --
+// shutdown behaviour, for instance, which has no HTTP surface.
+func NewService(t *testing.T) (*ingest.Service, *store.Store) {
 	t.Helper()
 	cfg := config.Load()
 
@@ -71,10 +73,28 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := ingest.New(s, stats.NewCache(), rdb, log)
+	return ingest.New(s, stats.NewCache(), rdb, Logger()), s
+}
 
-	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
-	t.Cleanup(srv.Close)
+// Logger returns a logger that discards everything, so test output stays
+// readable.
+func Logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// The server drains the service's background work on close, so a test that
+// finishes does not leave recording jobs running into the next one.
+func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
+	t.Helper()
+
+	svc, s := NewService(t)
+
+	srv := httptest.NewServer(httpapi.NewRouter(svc, Logger()))
+	t.Cleanup(func() {
+		srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = svc.Shutdown(ctx)
+	})
 	return srv, s
 }
