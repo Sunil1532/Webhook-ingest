@@ -53,11 +53,15 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shutdown", "err", err)
+		log.Error("shutdown http server", "err", err)
 	}
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Error("drain background work", "err", err)
+	}
+	log.Info("shutdown complete")
 }

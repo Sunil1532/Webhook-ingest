@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -27,6 +28,9 @@ type Service struct {
 	log      *slog.Logger
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
+	bg       sync.WaitGroup
+	mu       sync.Mutex
+	closing  bool
 }
 
 // New builds a Service.
@@ -92,9 +96,24 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	return nil
 }
 
-// startRecordingWork runs processRecording off the request path.
+// startRecordingWork runs processRecording off the request path, tracked so
+// that shutdown can wait for it.
 func (s *Service) startRecordingWork(rec store.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closing {
+		// Shutdown is already draining. Say so loudly rather than starting
+		// work nobody is waiting for.
+		s.log.Warn("recording not started, service is shutting down",
+			"event_id", rec.EventID, "call_id", rec.CallID)
+		return
+	}
+
+	s.bg.Add(1)
 	go func() {
+		defer s.bg.Done()
+
 		ctx, cancel := context.WithTimeout(s.bgCtx, recordingTimeout)
 		defer cancel()
 
@@ -103,6 +122,36 @@ func (s *Service) startRecordingWork(rec store.Event) {
 				"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
 		}
 	}()
+}
+
+// Shutdown stops accepting new background work and waits for what is already
+// running to finish, giving up when ctx expires.
+//
+// Callers should shut the HTTP server down first: that way no new deliveries
+// can arrive, and this only has to drain what is genuinely in flight.
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+
+	// bg.Wait blocks, so it is moved off this goroutine to keep the ctx
+	// deadline meaningful.
+	drained := make(chan struct{})
+	go func() {
+		s.bg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		s.bgCancel()
+		return nil
+	case <-ctx.Done():
+		// Out of time. Cancel so the stragglers unwind rather than being
+		// killed mid-statement by process exit.
+		s.bgCancel()
+		return ctx.Err()
+	}
 }
 
 // processRecording downloads and transcodes the call recording, then marks
