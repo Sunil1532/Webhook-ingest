@@ -14,7 +14,10 @@ import (
 )
 
 // recordingWork stands in for downloading and transcoding a recording.
-const recordingWork = 50 * time.Millisecond
+const (
+	recordingWork = 50 * time.Millisecond
+	recordingTimeout = 30 * time.Second
+)
 
 // Service ingests webhook deliveries.
 type Service struct {
@@ -22,11 +25,21 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
-	return &Service{store: s, cache: c, rdb: rdb, log: log}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	return &Service{
+		store:    s,
+		cache:    c,
+		rdb:      rdb,
+		log:      log,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
+	}
 }
 
 // Stats returns the cached totals for an account.
@@ -70,23 +83,34 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
 		return err
 	}
-	s.cache.Record(rec.AccountID, rec.DurationSec)
-
-	// Recordings are slow to fetch, so that part does not block the provider.
+		// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		s.startRecordingWork(rec)
 	}
 
 	return nil
 }
 
+// startRecordingWork runs processRecording off the request path.
+func (s *Service) startRecordingWork(rec store.Event) {
+	go func() {
+		ctx, cancel := context.WithTimeout(s.bgCtx, recordingTimeout)
+		defer cancel()
+
+		if err := s.processRecording(ctx, rec); err != nil {
+			s.log.Error("process recording",
+				"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
+		}
+	}()
+}
+
 // processRecording downloads and transcodes the call recording, then marks
 // the call as done.
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
-	time.Sleep(recordingWork)
+	select {
+	case <-time.After(recordingWork):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
 }
